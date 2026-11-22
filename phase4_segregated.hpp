@@ -3,55 +3,15 @@
 #include "phase2_metabase.hpp"
 #include "phase3_buddy.hpp"
 
-struct AllocEvent {
-    void*  ptr;
-    size_t size;
-    bool   is_alloc;
-};
-
-class EventStack {
-public:
-    static const size_t CAPACITY = 4096;
-    AllocEvent data[CAPACITY];
-    size_t top_index;
-
-    void init() {
-        top_index = 0;
-    }
-
-    void push(void* ptr, size_t size, bool is_alloc) {
-        if (top_index < CAPACITY) {
-            data[top_index].ptr      = ptr;
-            data[top_index].size     = size;
-            data[top_index].is_alloc = is_alloc;
-            top_index++;
-        }
-    }
-
-    bool empty() {
-        return top_index == 0;
-    }
-
-    size_t size() {
-        return top_index;
-    }
-
-    AllocEvent pop() {
-        if (top_index == 0) return {nullptr, 0, false};
-        top_index--;
-        return data[top_index];
-    }
-};
-
 struct SmallFreeNode {
     SmallFreeNode* next;
 };
 
 class SegregatedAllocator {
 public:
-    static const int    NUM_CLASSES = 5;    // 16B, 32B, 64B, 128B, 256B
+    static const int    NUM_CLASSES = 5;
     static const size_t MAX_SMALL   = 256;
-    static const size_t SLAB_SIZE   = 4096; // Ask Buddy for 4 KB slabs when empty
+    static const size_t SLAB_SIZE   = 4096;
 
     Arena*             arena;
     MetadataHashTable* hash_table;
@@ -79,7 +39,6 @@ public:
             return false;
         }
 
-        // Remove the 4 KB slab card from hash_table so Buddy never merges it while Segregated owns it
         hash_table->remove(slab);
 
         size_t block_size = (size_t(16) << class_idx);
@@ -116,7 +75,6 @@ public:
         free_lists[class_idx] = node->next;
         free_counts[class_idx]--;
 
-        // Register in your Phase 2 Hash Table with allocator_type = 1 (Segregated)
         hash_table->put(node, block_size, false, 1);
         return node;
     }
@@ -132,7 +90,6 @@ public:
         free_lists[class_idx] = node;
         free_counts[class_idx]++;
 
-        // Remove from Hash Table so double-free is blocked
         hash_table->remove(ptr);
         return true;
     }
@@ -166,7 +123,6 @@ public:
     MetadataHashTable   hash_table;
     BuddyAllocator      buddy;
     SegregatedAllocator segregated;
-    EventStack          event_log;
 
     size_t total_allocs;
     size_t total_frees;
@@ -174,13 +130,11 @@ public:
     size_t total_requested_bytes;
     size_t total_allocated_bytes;
     size_t current_allocated_bytes;
-    bool   record_events;
 
-    CustomAllocator(bool log_events = false) {
+    CustomAllocator() {
         hash_table.init(&arena);
         buddy.init(&arena, &hash_table);
         segregated.init(&arena, &hash_table, &buddy);
-        event_log.init();
 
         total_allocs            = 0;
         total_frees             = 0;
@@ -188,7 +142,6 @@ public:
         total_requested_bytes   = 0;
         total_allocated_bytes   = 0;
         current_allocated_bytes = 0;
-        record_events           = log_events;
     }
 
     void* my_malloc(size_t size) {
@@ -211,9 +164,6 @@ public:
             total_requested_bytes   += size;
             total_allocated_bytes   += actual_size;
             current_allocated_bytes += actual_size;
-            if (record_events) {
-                event_log.push(ptr, size, true);
-            }
         }
         return ptr;
     }
@@ -242,9 +192,6 @@ public:
             total_frees++;
             if (active_allocs > 0) active_allocs--;
             if (current_allocated_bytes >= block_size) current_allocated_bytes -= block_size;
-            if (record_events) {
-                event_log.push(ptr, block_size, false);
-            }
         }
         return ok;
     }

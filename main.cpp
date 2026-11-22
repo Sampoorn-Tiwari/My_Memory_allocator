@@ -7,8 +7,6 @@
 #include <cassert>
 
 #include "phase4_segregated.hpp"
-#include "phase5_strat.hpp"
-#include "phase6_analytic.hpp"
 
 using Clock = std::chrono::high_resolution_clock;
 
@@ -17,7 +15,7 @@ void run_correctness_tests() {
     std::cout << "  1. FUNCTIONAL VERIFICATION SUITE (PHASES 1 - 4)\n";
     std::cout << "====================================================================\n";
 
-    CustomAllocator alloc(true);
+    CustomAllocator alloc;
 
     int* small_a = static_cast<int*>(alloc.my_malloc(32));
     int* small_b = static_cast<int*>(alloc.my_malloc(64));
@@ -42,24 +40,22 @@ void run_correctness_tests() {
     assert(alloc.my_free(small_reused) == true);
     assert(alloc.my_free(small_b) == true);
 
-    std::cout << "  [PASS] Segregated 16B-256B O(1) Allocation & Zero-Split Reuse\n";
-    std::cout << "  [PASS] Buddy >256B Power-of-2 Splitting & Relative-XOR Coalescing\n";
-    std::cout << "  [PASS] Metadata Hash Table Lookup & Recycled Slot Reuse\n";
-    std::cout << "  [PASS] Double-Free Rejection & Event Stack Logging ("
-              << alloc.event_log.size() << " events captured)\n";
+    std::cout << "  [PASS] Phase 1: OS mmap() 20 MB Dual-Zone Arena & Alignment\n";
+    std::cout << "  [PASS] Phase 2: Metadata Hash Table Lookup & Slot Recycling\n";
+    std::cout << "  [PASS] Phase 3: Buddy Splitting & Relative-XOR Twin Coalescing\n";
+    std::cout << "  [PASS] Phase 4: Segregated 16B-256B O(1) Reuse & Double-Free Guard\n";
 }
 
 struct BenchResult {
     std::string name;
     double avg_alloc_ns;
     double avg_free_ns;
-    double max_latency_ns;
     double ops_per_sec;
-    double internal_frag;
-    double external_frag;
+    size_t splits;
+    size_t merges;
 };
 
-BenchResult benchmark_hybrid_fragmented(const std::vector<size_t>& init_sizes, const std::vector<size_t>& test_sizes) {
+BenchResult benchmark_hybrid(const std::vector<size_t>& init_sizes, const std::vector<size_t>& test_sizes) {
     CustomAllocator alloc;
     std::vector<void*> init_ptrs(init_sizes.size(), nullptr);
     for (size_t i = 0; i < init_sizes.size(); i++) {
@@ -73,19 +69,12 @@ BenchResult benchmark_hybrid_fragmented(const std::vector<size_t>& init_sizes, c
     }
 
     std::vector<void*> test_ptrs(test_sizes.size(), nullptr);
-    double max_ns = 0.0;
 
     auto t0 = Clock::now();
     for (size_t i = 0; i < test_sizes.size(); i++) {
-        auto s0 = Clock::now();
         test_ptrs[i] = alloc.my_malloc(test_sizes[i]);
-        auto s1 = Clock::now();
-        double dt = std::chrono::duration<double, std::nano>(s1 - s0).count();
-        if (dt > max_ns) max_ns = dt;
     }
     auto t1 = Clock::now();
-
-    AllocatorStats mid_stats = alloc.get_stats();
 
     auto f0 = Clock::now();
     for (size_t i = 0; i < test_sizes.size(); i++) {
@@ -105,52 +94,46 @@ BenchResult benchmark_hybrid_fragmented(const std::vector<size_t>& init_sizes, c
         "Hybrid (Seg+Buddy)",
         alloc_ns / test_sizes.size(),
         free_ns / test_sizes.size(),
-        max_ns,
         (2.0 * test_sizes.size()) / total_sec,
-        mid_stats.internal_frag_pct,
-        mid_stats.external_frag_pct
+        alloc.buddy.total_splits,
+        alloc.buddy.total_merges
     };
 }
 
-BenchResult benchmark_strategy_fragmented(const std::string& label, SearchStrategy strat,
-                                          const std::vector<size_t>& init_sizes,
-                                          const std::vector<size_t>& test_sizes) {
-    VariableStrategyAllocator alloc(strat);
+BenchResult benchmark_pure_buddy(const std::vector<size_t>& init_sizes, const std::vector<size_t>& test_sizes) {
+    Arena arena;
+    MetadataHashTable table;
+    table.init(&arena);
+    BuddyAllocator buddy;
+    buddy.init(&arena, &table);
+
     std::vector<void*> init_ptrs(init_sizes.size(), nullptr);
     for (size_t i = 0; i < init_sizes.size(); i++) {
-        init_ptrs[i] = alloc.allocate(init_sizes[i]);
+        init_ptrs[i] = buddy.allocate(init_sizes[i]);
     }
     for (size_t i = 0; i < init_sizes.size(); i += 2) {
         if (init_ptrs[i]) {
-            alloc.deallocate(init_ptrs[i]);
+            buddy.deallocate(init_ptrs[i]);
             init_ptrs[i] = nullptr;
         }
     }
 
     std::vector<void*> test_ptrs(test_sizes.size(), nullptr);
-    double max_ns = 0.0;
 
     auto t0 = Clock::now();
     for (size_t i = 0; i < test_sizes.size(); i++) {
-        auto s0 = Clock::now();
-        test_ptrs[i] = alloc.allocate(test_sizes[i]);
-        auto s1 = Clock::now();
-        double dt = std::chrono::duration<double, std::nano>(s1 - s0).count();
-        if (dt > max_ns) max_ns = dt;
+        test_ptrs[i] = buddy.allocate(test_sizes[i]);
     }
     auto t1 = Clock::now();
 
-    double int_f = alloc.get_internal_frag_pct();
-    double ext_f = alloc.get_external_frag_pct();
-
     auto f0 = Clock::now();
     for (size_t i = 0; i < test_sizes.size(); i++) {
-        if (test_ptrs[i]) alloc.deallocate(test_ptrs[i]);
+        if (test_ptrs[i]) buddy.deallocate(test_ptrs[i]);
     }
     auto f1 = Clock::now();
 
     for (size_t i = 1; i < init_sizes.size(); i += 2) {
-        if (init_ptrs[i]) alloc.deallocate(init_ptrs[i]);
+        if (init_ptrs[i]) buddy.deallocate(init_ptrs[i]);
     }
 
     double alloc_ns  = std::chrono::duration<double, std::nano>(t1 - t0).count();
@@ -158,17 +141,16 @@ BenchResult benchmark_strategy_fragmented(const std::string& label, SearchStrate
     double total_sec = (alloc_ns + free_ns) / 1e9;
 
     return {
-        label,
+        "Pure Buddy Only",
         alloc_ns / test_sizes.size(),
         free_ns / test_sizes.size(),
-        max_ns,
         (2.0 * test_sizes.size()) / total_sec,
-        int_f,
-        ext_f
+        buddy.total_splits,
+        buddy.total_merges
     };
 }
 
-BenchResult benchmark_glibc_fragmented(const std::vector<size_t>& init_sizes, const std::vector<size_t>& test_sizes) {
+BenchResult benchmark_glibc(const std::vector<size_t>& init_sizes, const std::vector<size_t>& test_sizes) {
     std::vector<void*> init_ptrs(init_sizes.size(), nullptr);
     for (size_t i = 0; i < init_sizes.size(); i++) {
         init_ptrs[i] = std::malloc(init_sizes[i]);
@@ -181,15 +163,10 @@ BenchResult benchmark_glibc_fragmented(const std::vector<size_t>& init_sizes, co
     }
 
     std::vector<void*> test_ptrs(test_sizes.size(), nullptr);
-    double max_ns = 0.0;
 
     auto t0 = Clock::now();
     for (size_t i = 0; i < test_sizes.size(); i++) {
-        auto s0 = Clock::now();
         test_ptrs[i] = std::malloc(test_sizes[i]);
-        auto s1 = Clock::now();
-        double dt = std::chrono::duration<double, std::nano>(s1 - s0).count();
-        if (dt > max_ns) max_ns = dt;
     }
     auto t1 = Clock::now();
 
@@ -211,35 +188,59 @@ BenchResult benchmark_glibc_fragmented(const std::vector<size_t>& init_sizes, co
         "Standard glibc",
         alloc_ns / test_sizes.size(),
         free_ns / test_sizes.size(),
-        max_ns,
         (2.0 * test_sizes.size()) / total_sec,
-        0.0,
-        0.0
+        0,
+        0
     };
 }
 
 void print_table(const std::string& title, const std::vector<BenchResult>& results) {
-    std::cout << "\n=========================================================================================\n";
+    std::cout << "\n===============================================================================\n";
     std::cout << "  " << title << "\n";
-    std::cout << "=========================================================================================\n";
-    std::cout << std::left << std::setw(20) << "Allocator"
+    std::cout << "===============================================================================\n";
+    std::cout << std::left << std::setw(22) << "Allocator"
               << std::right << std::setw(12) << "Alloc(ns)"
               << std::setw(12) << "Free(ns)"
-              << std::setw(12) << "Max(ns)"
               << std::setw(14) << "Ops/sec"
-              << std::setw(10) << "IntFrag%"
-              << std::setw(10) << "ExtFrag%" << "\n";
-    std::cout << "-----------------------------------------------------------------------------------------\n";
+              << std::setw(10) << "Splits"
+              << std::setw(10) << "Merges" << "\n";
+    std::cout << "-------------------------------------------------------------------------------\n";
     for (const auto& r : results) {
-        std::cout << std::left << std::setw(20) << r.name
+        std::cout << std::left << std::setw(22) << r.name
                   << std::right << std::fixed << std::setprecision(1)
                   << std::setw(12) << r.avg_alloc_ns
                   << std::setw(12) << r.avg_free_ns
-                  << std::setw(12) << r.max_latency_ns
                   << std::setw(14) << std::setprecision(0) << r.ops_per_sec
-                  << std::setw(10) << std::setprecision(2) << r.internal_frag
-                  << std::setw(10) << r.external_frag << "\n";
+                  << std::setw(10) << r.splits
+                  << std::setw(10) << r.merges << "\n";
     }
+}
+
+void print_arena_map(CustomAllocator& alloc) {
+    const int SLOTS = 64;
+    const size_t SLOT_BYTES = Arena::PAYLOAD_SIZE / SLOTS;
+    char bar[SLOTS + 1];
+    for (int i = 0; i < SLOTS; i++) bar[i] = '.';
+    bar[SLOTS] = '\0';
+
+    for (size_t b = 0; b < MetadataHashTable::NUM_BUCKETS; b++) {
+        HashNode* curr = alloc.hash_table.buckets[b];
+        while (curr != nullptr) {
+            if (!curr->is_free) {
+                size_t start_off = alloc.arena.get_offset(curr->block_ptr);
+                size_t end_off   = start_off + curr->block_size;
+                size_t s_slot    = start_off / SLOT_BYTES;
+                size_t e_slot    = (end_off + SLOT_BYTES - 1) / SLOT_BYTES;
+                if (e_slot > (size_t)SLOTS) e_slot = SLOTS;
+                char sym = (curr->allocator_type == 1) ? 'S' : 'B';
+                for (size_t k = s_slot; k < e_slot; k++) bar[k] = sym;
+            }
+            curr = curr->next;
+        }
+    }
+
+    std::cout << "\n[Arena 16 MB Map | 1 char = 256 KB | '.'=Free, 'S'=Segregated, 'B'=Buddy]\n";
+    std::cout << "  [" << bar << "]\n";
 }
 
 int main() {
@@ -247,48 +248,37 @@ int main() {
 
     std::mt19937 rng(42);
 
-    const size_t N_SMALL_INIT = 3000;
-    const size_t N_SMALL_TEST = 1500;
-    std::vector<size_t> small_init(N_SMALL_INIT), small_test(N_SMALL_TEST);
+    std::vector<size_t> small_init(3000), small_test(1500);
     std::uniform_int_distribution<size_t> small_dist(16, 256);
-    for (size_t i = 0; i < N_SMALL_INIT; i++) small_init[i] = small_dist(rng);
-    for (size_t i = 0; i < N_SMALL_TEST; i++) small_test[i] = small_dist(rng);
+    for (size_t& x : small_init) x = small_dist(rng);
+    for (size_t& x : small_test) x = small_dist(rng);
 
-    std::vector<BenchResult> r_small = {
-        benchmark_hybrid_fragmented(small_init, small_test),
-        benchmark_strategy_fragmented("First-Fit", SearchStrategy::FIRST_FIT, small_init, small_test),
-        benchmark_strategy_fragmented("Best-Fit", SearchStrategy::BEST_FIT, small_init, small_test),
-        benchmark_strategy_fragmented("AVL Best-Fit", SearchStrategy::AVL_BEST_FIT, small_init, small_test),
-        benchmark_strategy_fragmented("Max-Heap WorstFit", SearchStrategy::WORST_FIT_HEAP, small_init, small_test),
-        benchmark_glibc_fragmented(small_init, small_test)
-    };
-    print_table("2. WORKLOAD A: FRAGMENTED SMALL-BLOCK POOL (1,500 holes, 16B - 256B)", r_small);
+    print_table("2. SMALL WORKLOAD (16B - 256B, 1,500 fragmented holes)", {
+        benchmark_hybrid(small_init, small_test),
+        benchmark_pure_buddy(small_init, small_test),
+        benchmark_glibc(small_init, small_test)
+    });
 
-    const size_t N_MIX_INIT = 2000;
-    const size_t N_MIX_TEST = 1000;
-    std::vector<size_t> mix_init(N_MIX_INIT), mix_test(N_MIX_TEST);
+    std::vector<size_t> mix_init(2000), mix_test(1000);
     std::uniform_int_distribution<size_t> mix_dist(32, 4096);
-    for (size_t i = 0; i < N_MIX_INIT; i++) mix_init[i] = mix_dist(rng);
-    for (size_t i = 0; i < N_MIX_TEST; i++) mix_test[i] = mix_dist(rng);
+    for (size_t& x : mix_init) x = mix_dist(rng);
+    for (size_t& x : mix_test) x = mix_dist(rng);
 
-    std::vector<BenchResult> r_mixed = {
-        benchmark_hybrid_fragmented(mix_init, mix_test),
-        benchmark_strategy_fragmented("First-Fit", SearchStrategy::FIRST_FIT, mix_init, mix_test),
-        benchmark_strategy_fragmented("Best-Fit", SearchStrategy::BEST_FIT, mix_init, mix_test),
-        benchmark_strategy_fragmented("AVL Best-Fit", SearchStrategy::AVL_BEST_FIT, mix_init, mix_test),
-        benchmark_strategy_fragmented("Max-Heap WorstFit", SearchStrategy::WORST_FIT_HEAP, mix_init, mix_test),
-        benchmark_glibc_fragmented(mix_init, mix_test)
-    };
-    print_table("3. WORKLOAD B: FRAGMENTED MIXED WORKLOAD (1,000 holes, 32B - 4KB)", r_mixed);
+    print_table("3. MIXED WORKLOAD (32B - 4KB, 1,000 fragmented holes)", {
+        benchmark_hybrid(mix_init, mix_test),
+        benchmark_pure_buddy(mix_init, mix_test),
+        benchmark_glibc(mix_init, mix_test)
+    });
 
     std::cout << "\n====================================================================\n";
-    std::cout << "  4. LIVE ARENA TELEMETRY, VISUALIZER & GRAPH/ALGO MODULES\n";
+    std::cout << "  4. LIVE ARENA TELEMETRY & MEMORY MAP\n";
     std::cout << "====================================================================\n";
+
     CustomAllocator live_alloc;
-    std::vector<void*> live_ptrs;
-    for (int i = 0; i < 40; i++) live_ptrs.push_back(live_alloc.my_malloc(64));
-    for (int i = 0; i < 8; i++)  live_ptrs.push_back(live_alloc.my_malloc(262144));
-    for (int i = 0; i < 8; i += 2) live_alloc.my_free(live_ptrs[40 + i]);
+    std::vector<void*> ptrs;
+    for (int i = 0; i < 40; i++) ptrs.push_back(live_alloc.my_malloc(64));
+    for (int i = 0; i < 8; i++)  ptrs.push_back(live_alloc.my_malloc(262144));
+    for (int i = 0; i < 8; i += 2) live_alloc.my_free(ptrs[40 + i]);
 
     AllocatorStats st = live_alloc.get_stats();
     std::cout << "  Active Allocations      : " << st.active_allocs << "\n";
@@ -297,9 +287,7 @@ int main() {
     std::cout << "  External Fragmentation  : " << st.external_frag_pct << "%\n";
     std::cout << "  Arena Memory Utilization: " << st.utilization_pct << "%\n";
 
-    MemoryAnalytics::print_arena_visual_map(live_alloc);
-    MemoryAnalytics::run_graph_bfs_dfs_demo(live_alloc);
-    MemoryAnalytics::run_algorithmic_optimizations_demo();
+    print_arena_map(live_alloc);
 
     return 0;
 }
